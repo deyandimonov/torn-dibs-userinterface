@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn RW DIBS
 // @namespace    https://github.com/deyandimonov/torn-dibs-userinterface
-// @version      1.2.2
+// @version      1.3.5
 // @description  Torn Ranked War DIBS helper
 // @author       Deyan Dimonov
 // @license      SEE LICENSE.md
@@ -65,6 +65,88 @@
   // from the console. unsafeWindow is the way back to the real page context.
   const pageWindow = (typeof unsafeWindow !== "undefined" && unsafeWindow) || window;
 
+  // Torn PDA runs userscripts in the page context and does not implement GM_*.
+  // Where a real userscript manager (Tampermonkey/Greasemonkey) is present the
+  // bare GM_* identifiers resolve inside the sandbox and every `typeof` guard
+  // below is "function" - the block is a complete no-op and browser behaviour
+  // is untouched. In PDA the guards see "undefined" and we polyfill onto the
+  // page window, where PDA's flat scope makes the bare identifier resolve.
+  (function polyfillGMforPDA() {
+    const w = pageWindow;
+    const readLocal = (key, def) => {
+      try {
+        const raw = localStorage.getItem(key);
+        if (raw === null) return def;
+        if (raw.startsWith("GMV2_")) {
+          const json = raw.slice(5);
+          if (json === "undefined") return def;
+          try { return JSON.parse(json); } catch { return raw; }
+        }
+        return raw;
+      } catch { return def; }
+    };
+    const writeLocal = (key, val) => {
+      try {
+        const s = JSON.stringify(val);
+        if (s === undefined) { localStorage.removeItem(key); return; }
+        localStorage.setItem(key, "GMV2_" + s);
+      } catch {}
+    };
+    if (typeof GM_getValue !== "function") {
+      w.GM_getValue = (key, def) => readLocal(key, def);
+    }
+    if (typeof GM_setValue !== "function") {
+      w.GM_setValue = (key, val) => writeLocal(key, val);
+    }
+    if (typeof GM_deleteValue !== "function") {
+      w.GM_deleteValue = key => { try { localStorage.removeItem(key); } catch {} };
+    }
+    if (typeof GM_registerMenuCommand !== "function") {
+      w.GM_registerMenuCommand = () => {};
+    }
+    if (typeof GM_xmlhttpRequest !== "function") {
+      w.GM_xmlhttpRequest = opts => {
+        const method = String((opts && opts.method) || "GET").toUpperCase();
+        const url = opts && opts.url;
+        const headers = (opts && opts.headers) || {};
+        const raw = opts && opts.data;
+        const bodyStr = raw === undefined ? undefined :
+          (typeof raw === "string" ? raw : JSON.stringify(raw));
+
+        const done = r => {
+          if (!opts || typeof opts.onload !== "function") return;
+          try {
+            opts.onload({
+              status: Number((r && r.status) || 0),
+              responseText: String((r && (r.responseText != null ? r.responseText : r.text)) || ""),
+              responseHeaders: String((r && r.responseHeaders) || ""),
+              statusText: String((r && r.statusText) || ""),
+            });
+          } catch {}
+        };
+        const fail = e => {
+          const msg = (e && e.message) || String(e || "");
+          try {
+            if (/timeout/i.test(msg) && opts && typeof opts.ontimeout === "function") opts.ontimeout(e);
+            else if (opts && typeof opts.onerror === "function") opts.onerror(e);
+          } catch {}
+        };
+
+        let p;
+        if (method === "GET"    && typeof PDA_httpGet    === "function") p = PDA_httpGet(url, headers);
+        else if (method === "POST"   && typeof PDA_httpPost   === "function") p = PDA_httpPost(url, headers, bodyStr);
+        else if (method === "PUT"    && typeof PDA_httpPut    === "function") p = PDA_httpPut(url, headers, bodyStr);
+        else if (method === "DELETE" && typeof PDA_httpDelete === "function") p = PDA_httpDelete(url, headers);
+        else if (method === "PATCH"  && typeof PDA_httpPatch  === "function") p = PDA_httpPatch(url, headers, bodyStr);
+        else p = fetch(url, { method, headers, body: bodyStr })
+          .then(res => res.text().then(t => ({ status: res.status, responseText: t })));
+
+        Promise.resolve(p).then(done).catch(fail);
+        return { abort() {} };
+      };
+    }
+  })();
+
   // Two enabled copies fighting over the same DOM is what makes this look
   // "reverted" to an older, broken rendering style.
   if (pageWindow.__tornDibsActiveVersion) {
@@ -77,7 +159,6 @@
 
   const CONFIG = {
     TORN_API_BASE: "https://api.torn.com/v2",
-    DEFAULT_API_BASE: "https://gcloud.d3software.eu",
 
     POLL_MS: 4000,          // refresh dibs + push our status readings
     TORN_SYNC_MS: 60000,    // re-resolve identity and current war
@@ -93,19 +174,51 @@
     ANCHOR: "left-icon",
     SIDE: "left",       // "left" | "right"
     VSIDE: "bottom",    // "top" | "bottom"
-    NUDGE_X: 0,
-    NUDGE_Y: -12.5,        // negative pushes further past the bottom edge
 
-    BADGE_W: 150,
-    BADGE_H: 15,
+    // All badge dimensions are RELATIVE to the row they sit on, so different
+    // monitors, DPRs and PDA all get proportional sizing. Absolute clamps
+    // stop the badge from becoming unreadable at extremes.
+    BADGE_W_PCT: 0.35,   // fraction of the row's width
+    BADGE_W_MIN: 90,     // px floor - unreadable below this
+    BADGE_W_MAX: 200,    // px ceiling - would cover too much of the row
+    BADGE_H_PCT: 0.65,   // fraction of the row's height
+    BADGE_H_MIN: 13,
+    BADGE_H_MAX: 22,
+
+    NUDGE_X: 0,          // px offset from the anchor corner, horizontally
+    NUDGE_Y_PCT: -0.83,  // fraction of badge height; negative = hang below
 
     ROW_TINT: true,
+
+    // Announce successful claims in Torn's faction chat as
+    // "🎯 TargetName [ID] DIBS". Set false to stay silent.
+    CHAT_ANNOUNCE: true,
 
     // Settings button position. Percent so it tracks the viewport rather
     // than sitting at a fixed pixel offset on tall monitors.
     BTN_TOP: "15%",
     BTN_RIGHT: "14px",
   };
+
+  // Torn PDA's own top chrome sits higher on the viewport than the desktop
+  // navbar, so the 15% default lands the button on top of PDA UI. Lift it.
+  const IS_PDA = typeof PDA_httpGet === "function" ||
+    !!(pageWindow && pageWindow.flutter_inappwebview);
+  if (IS_PDA) {
+    CONFIG.BTN_TOP = "20%";
+    // PDA rows are much shorter and narrower than desktop, so the desktop
+    // ratios overshoot. Smaller %s and tighter clamps keep the badge legible
+    // without covering the whole row.
+    CONFIG.BADGE_W_PCT = 0.40;
+    CONFIG.BADGE_W_MIN = 70;
+    CONFIG.BADGE_W_MAX = 140;
+    CONFIG.BADGE_H_PCT = 0.30;
+    CONFIG.BADGE_H_MIN = 10;
+    CONFIG.BADGE_H_MAX = 16;
+    // Row layout in PDA is denser; hanging the badge as far below on PDA
+    // as on desktop parks it outside the row. Cut the drop roughly in half.
+    CONFIG.NUDGE_Y_PCT = -0.33;
+  }
 
   // Glyphs chosen for width: these render narrow in Arial, so they cost
   // roughly one character each. At BADGE_W=38 that is the entire budget
@@ -137,6 +250,17 @@
     lastError: "", widthWarned: false,
   };
 
+  // Per-row cache. Holds the status cell reference (so we don't rescan the
+  // whole row DOM every render) and the last row geometry we positioned
+  // against, so we can skip layout-thrashing offset reads when nothing has
+  // resized. WeakMap = auto-cleaned when the row leaves the DOM.
+  const rowCache = new WeakMap();
+  const getRowCache = row => {
+    let c = rowCache.get(row);
+    if (!c) { c = {}; rowCache.set(row, c); }
+    return c;
+  };
+
   const log = (...a) => console.log("[Torn DIBS]", ...a);
   const err = (...a) => console.error("[Torn DIBS]", ...a);
 
@@ -148,7 +272,14 @@
 
   const apiBase = () => get(KEYS.API_BASE).replace(/\/+$/, "");
   const token = () => get(KEYS.SHARED_TOKEN);
-  const apiKey = () => get(KEYS.TORN_API_KEY);
+
+  // Torn PDA substitutes this literal at load time with the current user's
+  // API key. In a normal browser / userscript manager it stays as the raw
+  // placeholder string, which we detect and treat as "no PDA key available".
+  const PDA_APIKEY_INJECTED = "###PDA-APIKEY###";
+  const pdaApiKey = () =>
+    (IS_PDA && !/^#{3}.*#{3}$/.test(PDA_APIKEY_INJECTED)) ? PDA_APIKEY_INJECTED : "";
+  const apiKey = () => get(KEYS.TORN_API_KEY) || pdaApiKey();
   const isConfigured = () => !!(apiBase() && token() && apiKey());
 
   /* ------------------------------------------------------------------- http */
@@ -192,7 +323,6 @@
 
   function installStyle() {
     document.getElementById("tdibs-style")?.remove();
-    const w = CONFIG.BADGE_W, h = CONFIG.BADGE_H;
     const s = document.createElement("style");
     s.id = "tdibs-style";
     s.textContent = `
@@ -207,26 +337,28 @@
       .tdibs-badge{
         position:absolute !important;
         z-index:50 !important;
-        /* Width is pinned four ways on purpose: no stray rule from an older
-           build, from Torn, or from another script may stretch this back
-           into a full-width bar covering Level/FF/Score/Status/Attack. */
-        width:${w}px !important;
-        min-width:${w}px !important;
-        max-width:${w}px !important;
-        flex:0 0 ${w}px !important;
+        /* Dimensions live in CSS variables set per-badge by positionBadge,
+           so each row gets sizing proportional to its own width/height.
+           Width is still pinned four ways so no stray rule can stretch us
+           back into a full-width bar over Level/FF/Score/Status/Attack. */
+        width:var(--tdibs-w,150px) !important;
+        min-width:var(--tdibs-w,150px) !important;
+        max-width:var(--tdibs-w,150px) !important;
+        flex:0 0 var(--tdibs-w,150px) !important;
         inset:auto !important;
         float:none !important;
         clear:none !important;
-        height:${h}px !important;
-        line-height:${h - 2}px !important;
+        height:var(--tdibs-h,15px) !important;
+        line-height:calc(var(--tdibs-h,15px) - 2px) !important;
         box-sizing:border-box !important;
         display:block !important;
         margin:0 !important;
         padding:0 2px !important;
-        /* Tight tracking: at BADGE_W=38 an icon plus a four-letter word only
-           just fits. Letter-spacing is what pushes it over the edge, so it
-           goes negative rather than the badge getting wider. */
-        font:700 9px/${h - 2}px Arial,Helvetica,sans-serif !important;
+        /* Tight tracking: negative letter-spacing keeps icon+label inside
+           the badge instead of forcing it wider. */
+        font-family:Arial,Helvetica,sans-serif !important;
+        font-weight:700 !important;
+        font-size:var(--tdibs-fs,9px) !important;
         letter-spacing:-.2px !important;
         text-align:center !important;
         text-transform:uppercase !important;
@@ -269,7 +401,7 @@
   /* Names are the only state with real content to fit, so this one gets
      left-aligned small text instead of the centred label styling. */
   text-align:left !important;
-  font-size:6px !important;
+  font-size:calc(var(--tdibs-fs,9px) * 0.7) !important;
   letter-spacing:0 !important;
   padding:0 3px !important;
   text-transform:none !important;
@@ -461,7 +593,7 @@
         <div class="tdibs-sub">Enemy side only. Values stored locally in your userscript manager.</div>
         <label>API base<input id="tdibs-base" type="text" spellcheck="false" autocomplete="off"></label>
         <label>Shared token<input id="tdibs-token" type="password" autocomplete="off"></label>
-        <label>Torn PUBLIC API key<input id="tdibs-key" type="password" autocomplete="off"></label>
+        <label>Torn PUBLIC API key${pdaApiKey() ? " (optional \u2014 Torn PDA key will be used if blank)" : ""}<input id="tdibs-key" type="password" autocomplete="off"></label>
         <div class="tdibs-msg" id="tdibs-msg"></div>
         <div class="tdibs-diag" id="tdibs-diag"></div>
         <div class="tdibs-actions">
@@ -474,9 +606,9 @@
     const $ = sel => o.querySelector(sel);
     $("#tdibs-msg").textContent = message;
     $("#tdibs-diag").textContent = diagText();
-    $("#tdibs-base").value = apiBase() || CONFIG.DEFAULT_API_BASE;
+    $("#tdibs-base").value = apiBase();
     $("#tdibs-token").value = token();
-    $("#tdibs-key").value = apiKey();
+    $("#tdibs-key").value = get(KEYS.TORN_API_KEY);
 
     $("#tdibs-close").onclick = closeSetup;
     o.addEventListener("click", e => { if (e.target === o) closeSetup(); });
@@ -485,8 +617,12 @@
       const base = $("#tdibs-base").value.trim().replace(/\/+$/, "");
       const tok = $("#tdibs-token").value.trim();
       const key = $("#tdibs-key").value.trim();
-      if (!base || !tok || !key) {
-        $("#tdibs-msg").textContent = "All three fields are required.";
+      // In PDA the injected key covers the user-facing field, so only demand
+      // it when we have no fallback.
+      if (!base || !tok || (!key && !pdaApiKey())) {
+        $("#tdibs-msg").textContent = pdaApiKey()
+          ? "API base and shared token are required."
+          : "All three fields are required.";
         return;
       }
 
@@ -622,10 +758,17 @@
   const rowProfileLink = row => row.querySelector('a[href*="profiles.php?XID="]');
 
   function targetId(row) {
+    // Cache on the row element itself: the XID never changes for a given
+    // roster row, and every render + click otherwise re-parses the href.
+    const cached = row.dataset.tdibsId;
+    if (cached) return Number(cached);
     const a = rowProfileLink(row);
     if (!a) return 0;
-    try { return Number(new URL(a.href, location.origin).searchParams.get("XID") || 0); }
-    catch { return Number(String(a.getAttribute("href") || "").match(/[?&]XID=(\d+)/i)?.[1] || 0); }
+    let id;
+    try { id = Number(new URL(a.href, location.origin).searchParams.get("XID") || 0); }
+    catch { id = Number(String(a.getAttribute("href") || "").match(/[?&]XID=(\d+)/i)?.[1] || 0); }
+    if (id) row.dataset.tdibsId = String(id);
+    return id;
   }
 
   function targetName(row) {
@@ -651,11 +794,18 @@
     /^(okay|hospital|jail|traveling|travelling|abroad|federal|fallen)$/i;
 
   function findStatusCell(row) {
+    // Same cell across renders unless Torn re-renders the row, so cache it
+    // and only rescan if it fell out of the DOM. Scanning every div/span in
+    // the row on every paint was the biggest per-render cost.
+    const c = getRowCache(row);
+    if (c.statusCell && c.statusCell.isConnected &&
+        row.contains(c.statusCell)) return c.statusCell;
     for (const el of row.querySelectorAll("div, span")) {
       if (el.children.length > 0) continue;   // leaf text nodes only
       const txt = (el.textContent || "").trim();
-      if (txt && STATUS_WORDS.test(txt)) return el;
+      if (txt && STATUS_WORDS.test(txt)) { c.statusCell = el; return el; }
     }
+    c.statusCell = null;
     return null;
   }
 
@@ -701,6 +851,337 @@
       else state.lastError = `POST /api/status -> ${r.status}`;
     } catch (e) {
       state.lastError = e?.message || "status push failed";
+    }
+  }
+
+  /* ------------------------------------------------------------- chat post */
+
+  // Torn's current chat has ONE textarea plus a dropdown "channel toggler"
+  // (button[data-testid="dropdown-toggler"], aria-haspopup="listbox") whose
+  // text is the currently selected channel: "Faction", "Company", "Trade"...
+  // The same data-testid is used elsewhere on the page (war filter panel),
+  // so we prefer togglers whose text is one of the known channel names.
+  const CHANNEL_LABEL_RE = /^\s*(faction|company|trade|global|help|officer|support)\b/i;
+  const FACTION_LABEL_RE = /^\s*faction\b/i;
+
+  function findChannelToggler() {
+    const all = document.querySelectorAll(
+      'button[data-testid="dropdown-toggler"], button.toggler');
+    for (const b of all) {
+      if (CHANNEL_LABEL_RE.test((b.textContent || "").trim())) return b;
+    }
+    return all[0] || null;
+  }
+
+  // "Chat is open" iff the chat textarea is in the DOM. The channel toggler
+  // (data-testid="dropdown-toggler") is NOT a reliable signal - Torn's war
+  // filter panel also uses that testid, so togglers exist even with chat
+  // closed. The textarea's stable placeholder is the only truth.
+  const isChatOpen = () =>
+    !!document.querySelector('textarea[placeholder*="Type your message" i]');
+
+  // Torn's chat launcher is a `<button id="channel_panel_button:faction-<id>"
+  // title="Faction">`. The id prefix and title are stable across builds; the
+  // id suffix is the viewer's faction id. Clicking it both opens the chat
+  // panel (if closed) and selects the Faction channel, so no separate
+  // channel switch is needed afterwards.
+  function findChatLauncher() {
+    return document.querySelector('button[id^="channel_panel_button:faction"]') ||
+           document.querySelector('button[id^="channel_panel_button:"][title="Faction" i]') ||
+           null;
+  }
+
+  // Returns { wasOpen, launcher, openedByUs }. `launcher` is always the
+  // faction launcher button when it exists in the DOM; `openedByUs` tells
+  // the caller whether we popped the panel open (so we can close it again
+  // afterwards) or whether the user already had chat open.
+  async function ensureChatOpen() {
+    const launcher = findChatLauncher();
+    if (isChatOpen()) return { wasOpen: true, launcher, openedByUs: false };
+    if (!launcher) return { wasOpen: false, launcher: null, openedByUs: false };
+    try { launcher.click(); } catch {}
+    const start = Date.now();
+    while (Date.now() - start < 1500) {
+      await new Promise(r => setTimeout(r, 60));
+      if (isChatOpen()) return { wasOpen: false, launcher, openedByUs: true };
+    }
+    return { wasOpen: false, launcher, openedByUs: true };
+  }
+
+  // The chat textarea has a stable placeholder ("Type your message here...")
+  // that's been in Torn's chat for years. Torn also opens PRIVATE MESSAGE
+  // windows with the exact same placeholder, so `querySelector` alone would
+  // happily grab the first PM's textarea and we'd post the DIBS message to
+  // whichever player has a PM window open. Distinguish by walking up from
+  // each candidate: channel chats contain a `data-testid="dropdown-toggler"`
+  // whose text is a channel name; PM windows contain a header with a
+  // `data-label="avatar"` link to a Torn profile. Prefer the channel one.
+  function findChatTextareaFor(toggler) {
+    const candidates = [
+      ...document.querySelectorAll('textarea[placeholder*="Type your message" i]'),
+    ];
+    for (const t of document.querySelectorAll("textarea")) {
+      if (/(^|\s)textarea___/.test((t.className || "").toString()) &&
+          !candidates.includes(t)) {
+        candidates.push(t);
+      }
+    }
+
+    const inChannelPanel = ta => {
+      let el = ta;
+      for (let i = 0; i < 15 && el; i++, el = el.parentElement) {
+        const dt = el.querySelector?.(
+          'button[data-testid="dropdown-toggler"]');
+        if (dt && CHANNEL_LABEL_RE.test((dt.textContent || "").trim())) return true;
+      }
+      return false;
+    };
+    const inPMPanel = ta => {
+      let el = ta;
+      for (let i = 0; i < 15 && el; i++, el = el.parentElement) {
+        if (el.querySelector?.(
+          'a[data-label="avatar"][href*="profiles.php?XID="]')) return true;
+      }
+      return false;
+    };
+
+    const preferred = candidates.find(t => inChannelPanel(t) && !inPMPanel(t));
+    if (preferred) return preferred;
+    const notPM = candidates.find(t => !inPMPanel(t));
+    if (notPM) return notPM;
+
+    if (toggler) {
+      let el = toggler.parentElement;
+      for (let i = 0; i < 15 && el; i++, el = el.parentElement) {
+        const ta = el.querySelector("textarea");
+        if (ta && !inPMPanel(ta)) return ta;
+      }
+    }
+    return null;
+  }
+
+  function togglerIsFaction(toggler) {
+    return !!toggler && FACTION_LABEL_RE.test((toggler.textContent || "").trim());
+  }
+
+  // Detects whether Torn's chat is currently showing the Faction channel.
+  // Two independent signals because the layout differs: on desktop the
+  // dropdown toggler carries the channel name as its label; on PDA/mobile
+  // the toggler is icon-only, but the channel_panel_button:faction launcher
+  // gains an `opened___<hash>` class token when its own panel is active.
+  function isFactionChannelActive(launcher, toggler) {
+    if (toggler && togglerIsFaction(toggler)) return true;
+    if (launcher && /(^|\s)opened___/.test((launcher.className || "").toString())) {
+      return true;
+    }
+    return false;
+  }
+
+  // If chat is on another channel, switch to Faction. Clicking the faction
+  // launcher works on both desktop and PDA; the dropdown-based fallback
+  // covers layouts where the launcher isn't in the DOM.
+  async function ensureFactionChannel(launcher, toggler) {
+    if (isFactionChannelActive(launcher, toggler)) return true;
+    if (launcher) {
+      try { launcher.click(); } catch {}
+      for (let i = 0; i < 30; i++) {
+        await new Promise(r => setTimeout(r, 50));
+        if (isFactionChannelActive(launcher, findChannelToggler()) &&
+            isChatOpen()) return true;
+      }
+    }
+    if (toggler) return await selectFactionChannel(toggler);
+    return false;
+  }
+
+  // Open the dropdown listbox and click the "Faction" option. Torn renders
+  // the listbox as role="option" elements; fall back to any short element
+  // whose text starts with "Faction" if the role isn't there.
+  async function selectFactionChannel(toggler) {
+    if (!toggler) return false;
+    if (togglerIsFaction(toggler)) return true;
+    toggler.click();
+    for (let i = 0; i < 20; i++) {
+      await new Promise(r => setTimeout(r, 50));
+      const opts = document.querySelectorAll(
+        '[role="option"], [role="listbox"] li, [role="listbox"] button');
+      for (const o of opts) {
+        const t = (o.textContent || "").trim();
+        if (FACTION_LABEL_RE.test(t) && t.length < 40) {
+          o.click();
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  function waitForTextarea(toggler, timeoutMs) {
+    return new Promise(resolve => {
+      const start = Date.now();
+      const tick = () => {
+        const ta = findChatTextareaFor(toggler);
+        if (ta) return resolve(ta);
+        if (Date.now() - start > timeoutMs) return resolve(null);
+        setTimeout(tick, 100);
+      };
+      tick();
+    });
+  }
+
+  // Torn's send button is a `<button type="button">` containing only an SVG
+  // icon and no text. Third-party userscripts (Torn Tools, FF Scouter,
+  // TWSE...) inject their own siblings, so we identify Torn's button by
+  // structure, not by class name (which changes each Torn deploy):
+  //   - descendant of the same wrapper as the textarea
+  //   - contains an <svg> child
+  //   - has no visible text content
+  //   - has empty aria-label/title (Torn labels its icon send with nothing)
+  //   - is not the channel dropdown toggler
+  const isIconOnlyButton = b => {
+    if (!b.querySelector("svg")) return false;
+    if ((b.textContent || "").trim().length > 0) return false;
+    return true;
+  };
+  const isKnownThirdParty = b => {
+    const cls = (b.className || "").toString();
+    // TornTools = `tt-*`, FF Scouter = `_ff-*` or `ff-*`, TWSE = `twse-*`.
+    return /(^|\s)(tt-|_?ff-|twse-)/.test(cls);
+  };
+
+  // Torn's chat sidebar sits next to the input, so walking up from the
+  // textarea we'll hit an ancestor that also contains channel-panel buttons
+  // (Faction/Company/Trade/...). Those look like icon-only buttons too but
+  // clicking them switches channels instead of sending, so exclude them via
+  // their stable id prefix.
+  const isChannelPanelButton = b =>
+    /^channel_panel_button:/.test(b.id || "");
+
+  function findSendButton(ta, toggler) {
+    if (!ta) return null;
+    let scope = ta.parentElement;
+    for (let i = 0; i < 10 && scope; i++, scope = scope.parentElement) {
+      const buttons = [...scope.querySelectorAll("button")].filter(b =>
+        b !== toggler &&
+        b.getAttribute("data-testid") !== "dropdown-toggler" &&
+        !isKnownThirdParty(b) &&
+        !isChannelPanelButton(b) &&
+        isIconOnlyButton(b));
+      if (buttons.length) {
+        // Prefer buttons that follow the textarea in document order - Torn's
+        // send sits directly after the input, third-party stuff tends to
+        // land above it.
+        const after = buttons.find(b =>
+          ta.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+        return after || buttons[0];
+      }
+    }
+    return null;
+  }
+
+  // React tracks its own internal value on the input node, so `.value =`
+  // writes are discarded on next render. The native prototype setter fires
+  // the underlying browser setter which React's value-tracker recognises;
+  // dispatching a bubbling `input` event then triggers React's onChange.
+  async function announceInFactionChat(text) {
+    if (!CONFIG.CHAT_ANNOUNCE) return false;
+    let openedByUs = false;
+    let launcher = null;
+    try {
+      const openState = await ensureChatOpen();
+      openedByUs = openState.openedByUs;
+      launcher = openState.launcher;
+
+      const toggler = findChannelToggler();
+
+      // Always verify the active channel; a chat opened on Company/Trade
+      // would otherwise receive the DIBS message. ensureFactionChannel
+      // no-ops when we're already on Faction.
+      const factionOk = await ensureFactionChannel(launcher, toggler);
+      if (!factionOk) {
+        log("chat announce skipped: could not switch to Faction channel");
+        return false;
+      }
+
+      // Re-resolve after the possible channel switch: the toggler that
+      // existed before ensureFactionChannel may have been null (no channel
+      // chat open) or pointed at Company/Trade.
+      const factionToggler = findChannelToggler();
+      const ta = await waitForTextarea(factionToggler, 1500);
+      if (!ta) {
+        log("chat announce skipped: no chat textarea");
+        return false;
+      }
+
+      const proto = (pageWindow.HTMLTextAreaElement || HTMLTextAreaElement).prototype;
+      const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+
+      ta.focus();
+
+      // React keeps a private `_valueTracker` on the input node whose cached
+      // value it compares against on every input event. Force a different
+      // value so the next write is guaranteed to look like a change.
+      const tracker = ta._valueTracker;
+      if (tracker) {
+        try { tracker.setValue(text + "_"); } catch {}
+      }
+
+      if (setter) setter.call(ta, text); else ta.value = text;
+
+      ta.dispatchEvent(new Event("input", { bubbles: true }));
+      ta.dispatchEvent(new Event("change", { bubbles: true }));
+
+      // Secondary path: if React re-rendered and blanked us, try execCommand.
+      await new Promise(r => setTimeout(r, 30));
+      if (ta.value !== text) {
+        ta.focus();
+        try { ta.setSelectionRange(0, ta.value.length); } catch {}
+        try { document.execCommand("insertText", false, text); } catch {}
+      }
+
+      const send = findSendButton(ta, factionToggler);
+
+      for (let i = 0; send && send.disabled && i < 20; i++) {
+        await new Promise(r => setTimeout(r, 50));
+      }
+
+      if (send) {
+        if (send.disabled) {
+          try { send.removeAttribute("disabled"); } catch {}
+        }
+        try { send.click(); } catch {}
+        return true;
+      }
+
+      const form = ta.closest("form");
+      if (form && typeof form.requestSubmit === "function") {
+        form.requestSubmit();
+        return true;
+      }
+
+      const makeKey = type => {
+        const e = new KeyboardEvent(type, {
+          bubbles: true, cancelable: true, key: "Enter", code: "Enter",
+        });
+        Object.defineProperty(e, "keyCode", { get: () => 13 });
+        Object.defineProperty(e, "which",   { get: () => 13 });
+        return e;
+      };
+      ta.dispatchEvent(makeKey("keydown"));
+      ta.dispatchEvent(makeKey("keypress"));
+      ta.dispatchEvent(makeKey("keyup"));
+      return true;
+    } catch (e) {
+      err("chat announce failed", e);
+      return false;
+    } finally {
+      // Only restore the pre-call state: leave the chat alone if the user
+      // already had it open. 2500ms on PDA leaves headroom for the send XHR
+      // to fire before the panel is collapsed.
+      if (openedByUs && launcher) {
+        const closeDelayMs = IS_PDA ? 2500 : 1500;
+        setTimeout(() => { try { launcher.click(); } catch {} }, closeDelayMs);
+      }
     }
   }
 
@@ -777,6 +1258,7 @@ const shortOwner = name => {
     badge.dataset.state = "busy";
     badge.textContent = ICON.busy;
 
+    let claimed = false;
     try {
       if (st === "mine") {
         // No owner_id parameter: the server knows who we are, so we can only
@@ -816,10 +1298,15 @@ const shortOwner = name => {
           flash(badge, "WAIT");
         } else if (!r.data?.ok) {
           throw new Error(`refused: ${JSON.stringify(r.data)}`);
+        } else {
+          claimed = true;
         }
       }
       await refreshDibs();
       render();
+      if (claimed) {
+        announceInFactionChat(`\u{1F3AF} ${targetName(row)} [${id}] DIBS`);
+      }
     } catch (e) {
       state.lastError = e?.message || "action failed";
       err("action failed", e);
@@ -834,30 +1321,60 @@ const shortOwner = name => {
    * correctly on every row. Do not "improve" this without a screenshot.
    * ---------------------------------------------------------------------- */
 
+  // Compute per-row badge metrics: width and height as clamped fractions
+  // of the row itself, font size scaled to the resulting height. All values
+  // are integers so the browser doesn't sub-pixel the border.
+  function badgeMetrics(row) {
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+    const rw = row.offsetWidth || 800;
+    const rh = row.offsetHeight || 22;
+    const w = Math.round(clamp(rw * CONFIG.BADGE_W_PCT,
+                               CONFIG.BADGE_W_MIN, CONFIG.BADGE_W_MAX));
+    const h = Math.round(clamp(rh * CONFIG.BADGE_H_PCT,
+                               CONFIG.BADGE_H_MIN, CONFIG.BADGE_H_MAX));
+    const fs = clamp(Math.round(h * 0.6), 7, 12);
+    return { w, h, fs };
+  }
+
   // Hang the badge off ANY corner of a given box. SIDE picks the horizontal
-  // edge, VSIDE the vertical. NUDGE_X/Y always mean "pull inward, toward the
-  // centre of the box", regardless of which corner is chosen.
-  function hangOffCorner(badge, box) {
-    const { top, left, w, h } = box;
+  // edge, VSIDE the vertical. NUDGE_X and the computed nudgeY always mean
+  // "pull inward, toward the centre of the box", regardless of which corner.
+  function hangOffCorner(badge, box, w, h, nudgeY) {
+    const { top, left, w: bw, h: bh } = box;
     badge.style.removeProperty("right");   // clear stale value from a prior SIDE
 
     if (CONFIG.SIDE === "left") {
       badge.style.setProperty("left", `${left + CONFIG.NUDGE_X}px`, "important");
     } else {
       badge.style.setProperty("left",
-        `${left + w - CONFIG.BADGE_W - CONFIG.NUDGE_X}px`, "important");
+        `${left + bw - w - CONFIG.NUDGE_X}px`, "important");
     }
 
     if (CONFIG.VSIDE === "top") {
-      badge.style.setProperty("top", `${top + CONFIG.NUDGE_Y}px`, "important");
+      badge.style.setProperty("top", `${top + nudgeY}px`, "important");
     } else {
       badge.style.setProperty("top",
-        `${top + h - CONFIG.BADGE_H - CONFIG.NUDGE_Y}px`, "important");
+        `${top + bh - h - nudgeY}px`, "important");
     }
   }
 
   function positionBadge(row, badge) {
     const link = rowProfileLink(row);
+    const { w, h, fs } = badgeMetrics(row);
+    badge.style.setProperty("--tdibs-w", `${w}px`);
+    badge.style.setProperty("--tdibs-h", `${h}px`);
+    badge.style.setProperty("--tdibs-fs", `${fs}px`);
+    const nudgeY = h * CONFIG.NUDGE_Y_PCT;
+
+    // Coordinate reads force layout. Skip the whole reposition dance when
+    // the row hasn't resized since we last placed the badge - the badge is
+    // positioned relative to the row via offset* which stay valid until the
+    // row changes size.
+    const c = getRowCache(row);
+    const rw = row.offsetWidth, rh = row.offsetHeight;
+    const key = `${CONFIG.ANCHOR}|${CONFIG.SIDE}|${CONFIG.VSIDE}|${rw}x${rh}|${w}x${h}`;
+    if (c.posKey === key) return;
+    c.posKey = key;
 
     if (CONFIG.ANCHOR === "left-icon") {
       // ".member" is a stable UNHASHED class token (Torn's markup is
@@ -869,7 +1386,7 @@ const shortOwner = name => {
       hangOffCorner(badge, {
         top: cell.offsetTop, left: cell.offsetLeft,
         w: cell.offsetWidth, h: cell.offsetHeight,
-      });
+      }, w, h, nudgeY);
       return;
     }
 
@@ -879,7 +1396,7 @@ const shortOwner = name => {
         hangOffCorner(badge, {
           top: cell.offsetTop, left: cell.offsetLeft,
           w: cell.offsetWidth, h: cell.offsetHeight,
-        });
+        }, w, h, nudgeY);
         return;
       }
       // Status text not found (rare states, or DOM not settled) - fall
@@ -890,12 +1407,12 @@ const shortOwner = name => {
       hangOffCorner(badge, {
         top: link.offsetTop, left: link.offsetLeft,
         w: link.offsetWidth, h: link.offsetHeight,
-      });
+      }, w, h, nudgeY);
       return;
     }
 
     // Last-resort fallback: corner of the row itself.
-    badge.style.setProperty("top", `${2 + CONFIG.NUDGE_Y}px`, "important");
+    badge.style.setProperty("top", `${2 + nudgeY}px`, "important");
     if (CONFIG.SIDE === "left") {
       badge.style.setProperty("left", `${CONFIG.NUDGE_X}px`, "important");
       badge.style.removeProperty("right");
@@ -941,9 +1458,10 @@ const shortOwner = name => {
         // say so loudly rather than silently covering Torn's own columns.
         if (!state.widthWarned) {
           const bw = badge.getBoundingClientRect().width;
-          if (bw > CONFIG.BADGE_W * 2.5) {
+          const expected = badgeMetrics(row).w;
+          if (bw > expected * 2.5) {
             state.widthWarned = true;
-            err(`badge rendered ${Math.round(bw)}px wide (expected ${CONFIG.BADGE_W}px) - ` +
+            err(`badge rendered ${Math.round(bw)}px wide (expected ${expected}px) - ` +
                 `an old version's stylesheet is probably still active. Remove every ` +
                 `older "Torn RW DIBS" entry in your userscript manager and reload.`);
           }
@@ -975,10 +1493,18 @@ const shortOwner = name => {
 
   function installObserver() {
     let timer = null;
+    let rafPending = false;
+    const runRender = () => { rafPending = false; render(); };
     const schedule = () => {
       if (state.writing) return;
       clearTimeout(timer);
-      timer = setTimeout(render, 120);
+      // Debounce, then coalesce into a single frame so multiple mutation
+      // bursts (Torn Tools/TWSE etc.) collapse into one render pass.
+      timer = setTimeout(() => {
+        if (rafPending) return;
+        rafPending = true;
+        (window.requestAnimationFrame || setTimeout)(runRender);
+      }, 150);
     };
 
     const mo = new MutationObserver(muts => {
@@ -987,7 +1513,10 @@ const shortOwner = name => {
         if (m.type !== "childList") continue;
         for (const node of m.addedNodes) {
           if (!(node instanceof HTMLElement)) continue;
+          // Ignore mutations we caused ourselves or that live outside the
+          // roster entirely (chat panels, PDA UI, third-party toolbars).
           if (node.classList.contains("tdibs-badge")) continue;
+          if (node.id === "tdibs-btn" || node.id === "tdibs-overlay") continue;
           if (node.matches?.(".enemy, .faction-war") ||
               node.querySelector?.(".enemy, .faction-war")) {
             schedule();
@@ -1025,6 +1554,10 @@ const shortOwner = name => {
   /* -------------------------------------------------------------------- boot */
 
   async function tick() {
+    // Backgrounded tabs get throttled by the browser anyway; skipping the
+    // work outright saves the DOM scan + API round-trip when nobody is
+    // looking at the page.
+    if (typeof document !== "undefined" && document.hidden) return;
     try {
       const active = await syncIdentityAndWar(false);
       if (active) {
@@ -1063,11 +1596,14 @@ const shortOwner = name => {
       },
       side(where) { CONFIG.SIDE = where === "right" ? "right" : "left"; render(); },
       vside(where) { CONFIG.VSIDE = where === "bottom" ? "bottom" : "top"; render(); },
-      nudge(x, y = 0) { CONFIG.NUDGE_X = x; CONFIG.NUDGE_Y = y; render(); },
-      size(w, h) {
-        CONFIG.BADGE_W = w;
-        if (h) CONFIG.BADGE_H = h;
-        installStyle(); render();
+      // Horizontal nudge in px, vertical nudge as a fraction of badge height
+      // (negative = hang below the anchor cell).
+      nudge(x, yPct = 0) { CONFIG.NUDGE_X = x; CONFIG.NUDGE_Y_PCT = yPct; render(); },
+      // Both arguments are fractions of the row size (e.g. size(0.22, 0.7)).
+      size(wPct, hPct) {
+        if (wPct != null) CONFIG.BADGE_W_PCT = wPct;
+        if (hPct != null) CONFIG.BADGE_H_PCT = hPct;
+        render();
       },
       // Move the settings button without editing the file. Accepts any CSS
       // length: btn("20%"), btn("120px"), btn("15%", "40px").
@@ -1077,6 +1613,7 @@ const shortOwner = name => {
         installStyle();
       },
       tint(on) { CONFIG.ROW_TINT = !!on; installStyle(); },
+      chat(text) { return announceInFactionChat(String(text || "test")); },
       diag: () => { const t = diagText(); log("\n" + t); return t; },
       readRow: () => enemyRows().slice(0, 3).map(readRowStatus),
       reset() {
